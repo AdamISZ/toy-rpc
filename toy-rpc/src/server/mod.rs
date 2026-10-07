@@ -40,6 +40,14 @@ pub(crate) type AtomicClientId = AtomicU64;
 /// Remote client have their ID starting from `RESERVED_CLIENT_ID + 1`
 pub const RESERVED_CLIENT_ID: ClientId = 0;
 
+/// How long a client has to complete the WebSocket handshake
+#[cfg(any(feature = "ws_tokio", feature = "ws_async_std"))]
+const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to pause after an error accepting a connection
+#[cfg(any(feature = "ws_tokio", feature = "ws_async_std"))]
+const ACCEPT_ERROR_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// RPC Server
 ///
 /// ```
@@ -260,15 +268,45 @@ cfg_if! {
                             let mut incoming = listener.incoming();
 
                             while let Some(conn) = incoming.next().await {
-                                let stream = conn?;
-                                log::info!("Accepting incoming connection from {}", stream.peer_addr()?);
+                                // An error accepting one connection must not stop the
+                                // server. Pause briefly, since errors such as running out
+                                // of file descriptors would otherwise repeat immediately.
+                                let stream = match conn {
+                                    Ok(stream) => stream,
+                                    Err(err) => {
+                                        log::error!("Error accepting connection: {}", err);
+                                        #[cfg(all(feature = "tokio_runtime", not(feature = "async_std_runtime")))]
+                                        ::tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+                                        #[cfg(all(feature = "async_std_runtime", not(feature = "tokio_runtime")))]
+                                        ::async_std::task::sleep(ACCEPT_ERROR_PAUSE).await;
+                                        continue;
+                                    }
+                                };
+                                if let Ok(addr) = stream.peer_addr() {
+                                    log::info!("Accepting incoming connection from {}", addr);
+                                }
 
                                 let client_id = self.client_counter.fetch_add(1, Ordering::Relaxed);
                                 let pubsub_broker = self.pubsub_tx.clone();
-                                let ws_stream = accept_async(stream).await?;
-                                task::spawn(
-                                    Self::serve_ws_connection(ws_stream, self.services.clone(), client_id, pubsub_broker)
-                                );
+                                let services = self.services.clone();
+                                // The handshake runs in the connection's own task, with a
+                                // timeout, so that a client that fails it or never finishes
+                                // it cannot stop or block the accept loop.
+                                task::spawn(async move {
+                                    #[cfg(all(feature = "tokio_runtime", not(feature = "async_std_runtime")))]
+                                    let handshake = ::tokio::time::timeout(
+                                        WS_HANDSHAKE_TIMEOUT, accept_async(stream)).await;
+                                    #[cfg(all(feature = "async_std_runtime", not(feature = "tokio_runtime")))]
+                                    let handshake = ::async_std::future::timeout(
+                                        WS_HANDSHAKE_TIMEOUT, accept_async(stream)).await;
+                                    match handshake {
+                                        Ok(Ok(ws_stream)) => {
+                                            Self::serve_ws_connection(ws_stream, services, client_id, pubsub_broker).await
+                                        }
+                                        Ok(Err(err)) => log::error!("WebSocket handshake failed: {}", err),
+                                        Err(_) => log::error!("WebSocket handshake timed out"),
+                                    }
+                                });
                             }
 
                             Ok(())
